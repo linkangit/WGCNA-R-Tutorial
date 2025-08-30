@@ -1,0 +1,780 @@
+# ===============================================================================
+# COMPLETE WGCNA ANALYSIS PIPELINE
+# Weighted Gene Co-expression Network Analysis for RNA-seq Data
+# ===============================================================================
+# Author: [Your Name]
+# Date: [Current Date]
+# Description: Complete pipeline from raw RNA-seq counts to gene network modules
+# ===============================================================================
+
+# ===============================================================================
+# STEP 1: PACKAGE INSTALLATION AND LOADING
+# ===============================================================================
+
+# Install required packages (run once)
+if (!require("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager")
+}
+
+# Install Bioconductor packages
+BiocManager::install(c("DESeq2", "WGCNA"))
+
+# Install CRAN packages
+install.packages(c("tidyverse", "magrittr"))
+
+# Load required libraries
+library(tidyverse)     # For data manipulation and visualization
+library(magrittr)      # For the %>% pipe operator
+library(WGCNA)         # Main package for network analysis
+library(DESeq2)        # For count data normalization
+
+# Set up WGCNA environment
+allowWGCNAThreads()    # Enable multi-threading for faster computation
+
+# ===============================================================================
+# STEP 2: DATA LOADING AND INITIAL INSPECTION
+# ===============================================================================
+
+# Load your RNA-seq count data
+# Replace "your_data.txt" with your actual file path
+# Expected format: First column = Gene IDs, remaining columns = sample counts
+data <- readr::read_delim("your_data.txt", delim = "\t")
+
+# Basic data inspection
+print("Data dimensions (genes x samples):")
+print(dim(data))
+
+print("First 5 rows and 10 columns:")
+print(data[1:5, 1:10])
+
+print("Column names:")
+print(names(data))
+
+# Fix gene ID column name if needed
+names(data)[1] <- "Gene_ID"
+
+# Clean sample names (remove special characters that might cause issues)
+names(data) <- gsub("[^A-Za-z0-9_]", "_", names(data))
+
+# ===============================================================================
+# STEP 3: CREATE SAMPLE METADATA
+# ===============================================================================
+
+# Extract sample names (all columns except first)
+sample_names <- names(data)[-1]
+
+# Create metadata dataframe - MODIFY THIS BASED ON YOUR EXPERIMENTAL DESIGN
+# Example assumes sample names like "Treatment1_Rep1", "Treatment2_Rep1", etc.
+metadata <- data.frame(
+  Sample = sample_names,
+  Treatment = gsub("_.*", "", sample_names),    # Extract treatment name
+  Replicate = gsub(".*_", "", sample_names),    # Extract replicate number
+  stringsAsFactors = FALSE
+)
+
+# Display metadata to verify it's correct
+print("Sample metadata:")
+print(metadata)
+
+# If your sample naming is different, modify the above accordingly
+# Example alternatives:
+# - For names like "Ctrl.1", "Ctrl.2", "Treat.1": 
+#   Treatment = gsub("\\..*", "", sample_names)
+# - For names like "Sample_Ctrl_1": 
+#   Treatment = str_extract(sample_names, "(?<=_)[^_]+(?=_)")
+
+# ===============================================================================
+# STEP 4: EXPLORATORY DATA ANALYSIS
+# ===============================================================================
+
+# Convert data to long format for visualization
+data_long <- data %>%
+  pivot_longer(cols = -Gene_ID, names_to = "Sample", values_to = "Count") %>%
+  left_join(metadata, by = "Sample")
+
+# Plot 1: Expression distribution by sample (Quality Control)
+p1 <- data_long %>%
+  ggplot(aes(x = Sample, y = Count + 1)) +  # +1 to avoid log(0)
+  geom_violin(aes(fill = Treatment)) +
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  scale_y_log10() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Expression Distribution by Sample",
+       subtitle = "Look for outlier samples with unusual distributions",
+       y = "Gene Expression (log10 scale)",
+       x = "Sample")
+
+print(p1)
+
+# Plot 2: Sample correlation heatmap to identify outliers
+count_matrix_temp <- as.matrix(data[,-1])
+rownames(count_matrix_temp) <- data$Gene_ID
+sample_cor <- cor(count_matrix_temp, use = "complete.obs")
+
+# Convert correlation matrix to long format for plotting
+cor_long <- as.data.frame(sample_cor) %>%
+  rownames_to_column("Sample1") %>%
+  pivot_longer(-Sample1, names_to = "Sample2", values_to = "Correlation")
+
+p2 <- cor_long %>%
+  ggplot(aes(x = Sample1, y = Sample2, fill = Correlation)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0.8) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Sample-Sample Correlation Heatmap",
+       subtitle = "Samples should correlate highly within treatment groups")
+
+print(p2)
+
+# ===============================================================================
+# STEP 5: DATA NORMALIZATION WITH DESEQ2
+# ===============================================================================
+
+# Prepare count matrix for DESeq2 (integers required)
+count_matrix <- as.matrix(data[,-1])
+rownames(count_matrix) <- data$Gene_ID
+count_matrix <- round(count_matrix)  # Ensure integer counts
+
+print(paste("Count matrix dimensions:", nrow(count_matrix), "genes x", ncol(count_matrix), "samples"))
+
+# Create DESeq2 dataset object
+dds <- DESeqDataSetFromMatrix(
+  countData = count_matrix,
+  colData = metadata,
+  design = ~ Treatment  # Adjust design formula based on your experiment
+)
+
+# Remove genes with very low counts across all samples
+# Keep genes with at least 10 counts in at least 3 samples
+keep <- rowSums(counts(dds) >= 10) >= 3
+dds <- dds[keep,]
+
+print(paste("After low-count filtering:", nrow(dds), "genes remain"))
+
+# Run DESeq2 normalization
+dds <- DESeq(dds)
+
+# Get variance stabilized data (better for correlation analysis)
+vsd <- varianceStabilizingTransformation(dds)
+normalized_data <- assay(vsd)
+
+print("Normalization complete!")
+
+# ===============================================================================
+# STEP 6: GENE FILTERING FOR NETWORK ANALYSIS
+# ===============================================================================
+
+# Calculate variance for each gene across all samples
+gene_variances <- apply(normalized_data, 1, var)
+
+# Summary statistics for gene variance
+print("Gene variance summary:")
+print(summary(gene_variances))
+
+# Filter genes: keep most variable genes (adjust quantile as needed)
+# 0.75 = top 25% most variable genes
+# 0.50 = top 50% most variable genes (more genes, slower analysis)
+variance_quantile <- 0.75
+variance_threshold <- quantile(gene_variances, variance_quantile)
+
+# Keep genes above variance threshold
+high_var_genes <- gene_variances > variance_threshold
+filtered_data <- normalized_data[high_var_genes, ]
+
+print(paste("Variance threshold (", variance_quantile*100, "th percentile):", round(variance_threshold, 3)))
+print(paste("Genes retained for network analysis:", nrow(filtered_data)))
+print(paste("Percentage of genes kept:", round(100*nrow(filtered_data)/nrow(normalized_data), 1), "%"))
+
+# Visualize filtering effect
+variance_df <- data.frame(
+  Gene = names(gene_variances),
+  Variance = gene_variances,
+  Kept = gene_variances > variance_threshold
+)
+
+p3 <- variance_df %>%
+  ggplot(aes(x = Variance, fill = Kept)) +
+  geom_histogram(bins = 50, alpha = 0.7) +
+  geom_vline(xintercept = variance_threshold, color = "red", linetype = "dashed", size = 1) +
+  scale_x_log10() +
+  theme_bw() +
+  labs(title = "Gene Filtering Based on Variance",
+       subtitle = paste("Keeping", sum(high_var_genes), "genes above threshold"),
+       x = "Gene Variance (log10 scale)",
+       y = "Number of Genes")
+
+print(p3)
+
+# ===============================================================================
+# STEP 7: PREPARE DATA FOR WGCNA
+# ===============================================================================
+
+# Transpose data: WGCNA expects samples as rows, genes as columns
+wgcna_input <- t(filtered_data)
+
+print("WGCNA input matrix dimensions:")
+print(paste("Samples (rows):", nrow(wgcna_input)))
+print(paste("Genes (columns):", ncol(wgcna_input)))
+
+# Check for missing values (WGCNA cannot handle NAs)
+if(any(is.na(wgcna_input))) {
+  print("WARNING: Missing values detected!")
+  print(paste("Number of missing values:", sum(is.na(wgcna_input))))
+  
+  # Option 1: Remove genes with missing values
+  complete_genes <- complete.cases(t(wgcna_input))
+  wgcna_input <- wgcna_input[, complete_genes]
+  
+  # Option 2: Replace missing values with zeros (uncomment if needed)
+  # wgcna_input[is.na(wgcna_input)] <- 0
+  
+  print(paste("After removing incomplete genes:", ncol(wgcna_input), "genes remain"))
+} else {
+  print("✓ No missing values detected")
+}
+
+# ===============================================================================
+# STEP 8: SOFT THRESHOLD POWER SELECTION
+# ===============================================================================
+
+# This step determines the soft-thresholding power for network construction
+# It's crucial for creating a scale-free network topology
+
+print("Testing soft threshold powers...")
+print("This may take several minutes...")
+
+# Test different soft threshold powers
+powers <- c(1:10, seq(from = 12, to = 20, by = 2))
+
+# Calculate soft threshold statistics
+sft <- pickSoftThreshold(
+  wgcna_input,
+  powerVector = powers,
+  verbose = 5,
+  networkType = "signed"  # Consider direction of correlation
+)
+
+# Create diagnostic plots
+par(mfrow = c(1, 2))
+
+# Plot 1: Scale-free topology fit (R²) vs soft threshold power
+plot(sft$fitIndices[,1], 
+     -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
+     xlab = "Soft Threshold (power)", 
+     ylab = "Scale Free Topology Model Fit, signed R²",
+     type = "n", 
+     main = "Scale Independence",
+     cex.lab = 1.2, cex.axis = 1.2, cex.main = 1.2)
+
+text(sft$fitIndices[,1], 
+     -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
+     labels = powers, 
+     cex = 0.9, 
+     col = "red")
+
+# Add horizontal line at R² = 0.80 (commonly used threshold)
+abline(h = 0.80, col = "red", lty = 2)
+
+# Plot 2: Mean connectivity vs soft threshold power
+plot(sft$fitIndices[,1], 
+     sft$fitIndices[,5],
+     xlab = "Soft Threshold (power)", 
+     ylab = "Mean Connectivity", 
+     type = "n",
+     main = "Mean Connectivity",
+     cex.lab = 1.2, cex.axis = 1.2, cex.main = 1.2)
+
+text(sft$fitIndices[,1], 
+     sft$fitIndices[,5], 
+     labels = powers, 
+     cex = 0.9, 
+     col = "red")
+
+# Reset plotting parameters
+par(mfrow = c(1, 1))
+
+# Display soft threshold statistics
+print("Soft threshold power selection results:")
+print(sft$fitIndices)
+
+# Automatic power selection (choose first power where R² > 0.8)
+power_threshold <- 0.80
+auto_power <- min(powers[sft$fitIndices[,2] > power_threshold], na.rm = TRUE)
+
+if(is.infinite(auto_power)) {
+  auto_power <- 6  # Default fallback
+  print(paste("WARNING: No power achieved R² >", power_threshold))
+  print("Using default power of 6")
+} else {
+  print(paste("Automatically selected power:", auto_power, "( R² =", 
+              round(sft$fitIndices[sft$fitIndices[,1] == auto_power, 2], 3), ")"))
+}
+
+# MANUAL OVERRIDE: Set your chosen power here if you prefer manual selection
+# chosen_power <- 12  # Uncomment and set manually if needed
+chosen_power <- auto_power
+
+print(paste("Final chosen power:", chosen_power))
+
+# ===============================================================================
+# STEP 9: NETWORK CONSTRUCTION AND MODULE DETECTION
+# ===============================================================================
+
+print("Starting network construction and module detection...")
+print("This is computationally intensive and may take 30-60 minutes for large datasets")
+print(paste("Processing", nrow(wgcna_input), "samples and", ncol(wgcna_input), "genes"))
+
+# Main WGCNA function - constructs network and detects modules
+network <- blockwiseModules(
+  wgcna_input,
+  
+  # == Network Construction Parameters ==
+  power = chosen_power,                    # Soft threshold power
+  networkType = "signed",                  # Preserve correlation direction
+  
+  # == Topology Overlap Matrix (TOM) Parameters ==
+  TOMType = "signed",                      # Signed TOM
+  
+  # == Module Detection Parameters ==
+  deepSplit = 2,                           # Module splitting sensitivity (0-4)
+                                          # 0: fewer, larger modules
+                                          # 4: many, smaller modules
+  minModuleSize = 30,                     # Minimum genes per module
+  detectCutHeight = 0.995,                # Threshold for merging modules
+  
+  # == Module Merging Parameters ==
+  mergeCutHeight = 0.25,                  # Merge modules with >75% similarity
+  
+  # == Block Processing (for memory management) ==
+  maxBlockSize = 5000,                    # Max genes processed simultaneously
+                                          # Reduce if memory issues occur
+  
+  # == Performance Options ==
+  reassignThreshold = 0,                  # Gene reassignment p-value
+  pamRespectsDendro = FALSE,              # PAM respects dendrogram
+  
+  # == Output Options ==
+  saveTOMs = TRUE,                        # Save TOM for later use
+  saveTOMFileBase = "NetworkTOM",         # TOM file prefix
+  numericLabels = TRUE,                   # Use numbers instead of colors initially
+  verbose = 3                             # Progress reporting level
+)
+
+print("Network construction complete!")
+
+# Convert numeric labels to colors for visualization
+module_colors <- labels2colors(network$colors)
+module_labels <- network$colors
+
+# Display module information
+print("Module detection summary:")
+table(module_colors)
+
+print(paste("Total modules detected:", length(unique(module_colors[module_colors != "grey"]))))
+print(paste("Genes in grey module (unassigned):", sum(module_colors == "grey")))
+
+# ===============================================================================
+# STEP 10: VISUALIZE MODULE STRUCTURE
+# ===============================================================================
+
+# Plot dendrogram with module colors
+print("Plotting module dendrogram...")
+
+plotDendroAndColors(
+  network$dendrograms[[1]], 
+  module_colors[network$blockGenes[[1]]],
+  "Module colors",
+  dendroLabels = FALSE, 
+  hang = 0.03,
+  addGuide = TRUE, 
+  guideHang = 0.05,
+  main = "Gene Clustering Dendrogram and Module Colors"
+)
+
+# Create module assignment table
+module_assignments <- data.frame(
+  Gene_ID = names(network$colors),
+  Module_Number = network$colors,
+  Module_Color = module_colors,
+  stringsAsFactors = FALSE
+)
+
+# Show first few assignments
+print("First few module assignments:")
+print(head(module_assignments, 10))
+
+# Module size distribution
+module_sizes <- table(module_colors)
+print("Genes per module:")
+print(sort(module_sizes, decreasing = TRUE))
+
+# ===============================================================================
+# STEP 11: CALCULATE MODULE EIGENGENES
+# ===============================================================================
+
+# Calculate module eigengenes (representative expression profile for each module)
+print("Calculating module eigengenes...")
+
+MEs <- moduleEigengenes(wgcna_input, module_colors)$eigengenes
+MEs <- orderMEs(MEs)  # Order modules by similarity
+
+# Add sample information to eigengenes
+MEs$Sample <- rownames(MEs)
+MEs_with_traits <- MEs %>%
+  left_join(metadata, by = "Sample")
+
+print("Module eigengenes calculated successfully")
+print(paste("Number of module eigengenes:", ncol(MEs) - 1))
+
+# ===============================================================================
+# STEP 12: MODULE-TRAIT CORRELATION ANALYSIS
+# ===============================================================================
+
+print("Analyzing module-trait relationships...")
+
+# Prepare data for correlation analysis
+ME_matrix <- as.matrix(MEs[, !names(MEs) %in% c("Sample")])
+
+# Create trait matrix (convert categorical variables to numeric if needed)
+trait_data <- metadata
+rownames(trait_data) <- trait_data$Sample
+
+# Convert treatment to numeric (create dummy variables for each treatment)
+treatment_dummies <- model.matrix(~ Treatment - 1, data = trait_data)
+colnames(treatment_dummies) <- gsub("Treatment", "", colnames(treatment_dummies))
+
+# Calculate correlations between modules and traits
+module_trait_cor <- cor(ME_matrix, treatment_dummies, use = "complete.obs")
+module_trait_pvalue <- corPvalueStudent(module_trait_cor, nrow(ME_matrix))
+
+# Create visualization data
+cor_data <- expand.grid(
+  Module = rownames(module_trait_cor),
+  Trait = colnames(module_trait_cor)
+) %>%
+  mutate(
+    Correlation = as.vector(module_trait_cor),
+    P_value = as.vector(module_trait_pvalue),
+    Significance = ifelse(P_value < 0.05, "*", ""),
+    Module_clean = gsub("ME", "", Module)
+  )
+
+# Plot module-trait relationships
+p4 <- cor_data %>%
+  ggplot(aes(x = Trait, y = Module_clean, fill = Correlation)) +
+  geom_tile() +
+  geom_text(aes(label = Significance), color = "white", size = 6) +
+  scale_fill_gradient2(
+    low = "blue", 
+    mid = "white", 
+    high = "red", 
+    midpoint = 0,
+    limit = c(-1, 1),
+    name = "Correlation"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 10)
+  ) +
+  labs(
+    title = "Module-Trait Relationships",
+    subtitle = "* indicates p < 0.05",
+    x = "Treatment Groups",
+    y = "Gene Modules"
+  )
+
+print(p4)
+
+# ===============================================================================
+# STEP 13: IDENTIFY HUB GENES
+# ===============================================================================
+
+# Calculate intramodular connectivity for each gene
+print("Identifying hub genes...")
+
+# Calculate adjacency matrix
+adjacency <- adjacency(wgcna_input, power = chosen_power, type = "signed")
+
+# Calculate intramodular connectivity
+intramodular_connectivity <- intramodularConnectivity(adjacency, module_colors)
+
+# Add connectivity info to module assignments
+module_assignments$kWithin <- intramodular_connectivity$kWithin[module_assignments$Gene_ID]
+module_assignments$kOut <- intramodular_connectivity$kOut[module_assignments$Gene_ID]
+module_assignments$kDiff <- intramodular_connectivity$kDiff[module_assignments$Gene_ID]
+
+# Identify top hub genes for each module
+hub_genes <- chooseTopHubInEachModule(
+  wgcna_input, 
+  module_colors,
+  omitColors = "grey"
+)
+
+print("Top hub genes per module:")
+print(hub_genes)
+
+# Get top 5 hub genes per module
+top_hubs <- module_assignments %>%
+  filter(Module_Color != "grey") %>%
+  group_by(Module_Color) %>%
+  top_n(5, kWithin) %>%
+  arrange(Module_Color, desc(kWithin))
+
+print("Top 5 hub genes per module:")
+print(top_hubs)
+
+# ===============================================================================
+# STEP 14: EXPRESSION PROFILE VISUALIZATION
+# ===============================================================================
+
+# Plot expression profiles for modules of interest
+print("Creating expression profile plots...")
+
+# Select interesting modules based on trait correlations
+# You can modify this based on your module-trait correlation results
+interesting_modules <- cor_data %>%
+  filter(abs(Correlation) > 0.5, P_value < 0.05) %>%
+  pull(Module_clean) %>%
+  unique() %>%
+  head(6)  # Limit to 6 modules for readability
+
+if(length(interesting_modules) == 0) {
+  # Fallback: select largest modules if no significant correlations
+  interesting_modules <- names(sort(table(module_colors), decreasing = TRUE))[1:3]
+  interesting_modules <- interesting_modules[interesting_modules != "grey"]
+}
+
+print(paste("Plotting expression profiles for modules:", paste(interesting_modules, collapse = ", ")))
+
+# Prepare expression data for plotting
+expression_data <- filtered_data[module_assignments$Gene_ID[module_assignments$Module_Color %in% interesting_modules], ] %>%
+  as.data.frame() %>%
+  rownames_to_column("Gene_ID") %>%
+  left_join(select(module_assignments, Gene_ID, Module_Color), by = "Gene_ID") %>%
+  pivot_longer(cols = -c(Gene_ID, Module_Color), names_to = "Sample", values_to = "Expression") %>%
+  left_join(metadata, by = "Sample")
+
+# Create expression profile plot
+p5 <- expression_data %>%
+  ggplot(aes(x = Treatment, y = Expression, group = Gene_ID)) +
+  geom_line(alpha = 0.3, aes(color = Module_Color)) +
+  stat_summary(
+    aes(group = Module_Color, color = Module_Color), 
+    fun = mean, 
+    geom = "line", 
+    size = 2, 
+    alpha = 0.8
+  ) +
+  facet_wrap(~Module_Color, scales = "free_y") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  ) +
+  labs(
+    title = "Gene Expression Profiles by Module",
+    subtitle = "Individual genes (thin lines) and module average (thick lines)",
+    x = "Treatment Groups",
+    y = "Normalized Expression"
+  )
+
+print(p5)
+
+# ===============================================================================
+# STEP 15: NETWORK EXPORT FOR CYTOSCAPE
+# ===============================================================================
+
+print("Preparing network files for export...")
+
+# Create edge list for interesting modules only (to keep file size manageable)
+interesting_genes <- module_assignments %>%
+  filter(Module_Color %in% interesting_modules) %>%
+  pull(Gene_ID)
+
+print(paste("Creating network for", length(interesting_genes), "genes in", length(interesting_modules), "modules"))
+
+# Calculate TOM for genes of interest
+if(length(interesting_genes) > 1000) {
+  print("WARNING: Large number of genes may result in very large network files")
+  print("Consider focusing on fewer modules or top hub genes only")
+}
+
+# Get expression data for interesting genes
+subset_data <- filtered_data[interesting_genes, ]
+
+# Calculate TOM similarity matrix
+TOM <- TOMsimilarityFromExpr(
+  t(subset_data), 
+  power = chosen_power, 
+  networkType = "signed"
+)
+
+# Set gene names
+rownames(TOM) <- colnames(TOM) <- interesting_genes
+
+# Create edge list
+print("Creating edge list...")
+edge_list <- TOM %>%
+  as.data.frame() %>%
+  rownames_to_column("Gene1") %>%
+  pivot_longer(-Gene1, names_to = "Gene2", values_to = "Weight") %>%
+  filter(
+    Gene1 < Gene2,           # Remove duplicates (keep upper triangle)
+    Weight > 0.1             # Remove weak connections
+  ) %>%
+  left_join(
+    select(module_assignments, Gene_ID, Module_Color), 
+    by = c("Gene1" = "Gene_ID")
+  ) %>%
+  rename(Module1 = Module_Color) %>%
+  left_join(
+    select(module_assignments, Gene_ID, Module_Color), 
+    by = c("Gene2" = "Gene_ID")
+  ) %>%
+  rename(Module2 = Module_Color) %>%
+  arrange(desc(Weight))
+
+print(paste("Edge list created with", nrow(edge_list), "connections"))
+
+# ===============================================================================
+# STEP 16: SAVE ALL RESULTS
+# ===============================================================================
+
+print("Saving analysis results...")
+
+# 1. Module assignments
+write_tsv(module_assignments, "gene_modules.txt")
+print("✓ Saved gene_modules.txt")
+
+# 2. Module eigengenes with sample information
+write_tsv(MEs_with_traits, "module_eigengenes.txt")
+print("✓ Saved module_eigengenes.txt")
+
+# 3. Module-trait correlations
+correlation_results <- cor_data %>%
+  select(Module = Module_clean, Trait, Correlation, P_value) %>%
+  arrange(desc(abs(Correlation)))
+write_tsv(correlation_results, "module_trait_correlations.txt")
+print("✓ Saved module_trait_correlations.txt")
+
+# 4. Hub genes
+write_tsv(top_hubs, "hub_genes.txt")
+print("✓ Saved hub_genes.txt")
+
+# 5. Network edge list for Cytoscape
+write_tsv(edge_list, "network_edges.txt")
+print("✓ Saved network_edges.txt")
+
+# 6. Summary statistics
+summary_stats <- data.frame(
+  Metric = c(
+    "Total genes input",
+    "Genes after filtering",
+    "Samples analyzed", 
+    "Soft threshold power",
+    "Modules detected",
+    "Genes in grey module",
+    "Largest module size",
+    "Network edges exported"
+  ),
+  Value = c(
+    nrow(normalized_data),
+    nrow(filtered_data),
+    nrow(wgcna_input),
+    chosen_power,
+    length(unique(module_colors[module_colors != "grey"])),
+    sum(module_colors == "grey"),
+    max(table(module_colors)),
+    nrow(edge_list)
+  )
+)
+
+write_tsv(summary_stats, "analysis_summary.txt")
+print("✓ Saved analysis_summary.txt")
+
+# 7. Session information for reproducibility
+sink("session_info.txt")
+print("WGCNA Analysis Session Information")
+print("==================================")
+print(paste("Date:", Sys.Date()))
+print(paste("R version:", R.version.string))
+print("")
+print("Package versions:")
+sessionInfo()
+sink()
+print("✓ Saved session_info.txt")
+
+# ===============================================================================
+# STEP 17: ANALYSIS SUMMARY AND NEXT STEPS
+# ===============================================================================
+
+cat("\n")
+cat("================================================================================\n")
+cat("                           WGCNA ANALYSIS COMPLETE!                            \n")
+cat("================================================================================\n")
+cat("\n")
+
+cat("ANALYSIS SUMMARY:\n")
+cat("-----------------\n")
+cat(sprintf("• Input: %d genes across %d samples\n", nrow(normalized_data), ncol(normalized_data)))
+cat(sprintf("• Filtered to: %d most variable genes (top %d%%)\n", 
+            nrow(filtered_data), round(variance_quantile*100)))
+cat(sprintf("• Soft threshold power: %d\n", chosen_power))
+cat(sprintf("• Modules detected: %d (plus grey module)\n", 
+            length(unique(module_colors[module_colors != "grey"]))))
+cat(sprintf("• Unassigned genes (grey): %d\n", sum(module_colors == "grey")))
+cat(sprintf("• Network edges exported: %d\n", nrow(edge_list)))
+cat("\n")
+
+cat("FILES CREATED:\n")
+cat("--------------\n")
+cat("• gene_modules.txt - Gene-to-module assignments\n")
+cat("• module_eigengenes.txt - Module expression profiles\n")  
+cat("• module_trait_correlations.txt - Statistical correlations\n")
+cat("• hub_genes.txt - Most connected genes per module\n")
+cat("• network_edges.txt - Network for Cytoscape visualization\n")
+cat("• analysis_summary.txt - Key metrics from analysis\n")
+cat("• session_info.txt - Reproducibility information\n")
+cat("\n")
+
+cat("NEXT STEPS:\n")
+cat("-----------\n")
+cat("1. Gene Ontology Analysis:\n")
+cat("   • Use hub genes for functional enrichment analysis\n")
+cat("   • Try tools like DAVID, Enrichr, or clusterProfiler\n")
+cat("\n")
+cat("2. Network Visualization:\n")
+cat("   • Import network_edges.txt into Cytoscape\n")
+cat("   • Color nodes by module, size by connectivity\n")
+cat("\n")
+cat("3. Biological Validation:\n")
+cat("   • Literature review of hub genes\n")
+cat("   • Design experiments to test key predictions\n")
+cat("\n")
+cat("4. Integration:\n")
+cat("   • Combine with protein-protein interaction data\n")
+cat("   • Integrate with ChIP-seq or ATAC-seq if available\n")
+cat("\n")
+
+# Print modules of interest for follow-up
+if(length(interesting_modules) > 0) {
+  cat("MODULES OF INTEREST (strongly correlated with traits):\n")
+  cat("----------------------------------------------------\n")
+  for(mod in interesting_modules) {
+    mod_genes <- sum(module_assignments$Module_Color == mod)
+    cat(sprintf("• %s module: %d genes\n", stringr::str_to_title(mod), mod_genes))
+  }
+  cat("\nFocus functional analysis on these modules first!\n")
+}
+
+cat("\n")
+cat("Analysis completed successfully! 🎉\n")
+cat("Check the plots and output files for your results.\n")
+cat("\n")
+
+# ===============================================================================
+# END OF WGCNA ANALYSIS PIPELINE
+# ===============================================================================
