@@ -1,4 +1,4 @@
-# WGCNA Tutorial in R: From Raw Data to Gene Networks
+# WGCNA Tutorial for R users: From Raw Data to Gene Networks
 
 *A step-by-step guide to building weighted gene co-expression networks for any RNA-seq dataset*
 
